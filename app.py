@@ -1,10 +1,43 @@
+"""
+=========================================================
+AI 음식 레시피 챗봇 (개선판 v2)
+=========================================================
+
+본 개선판은 다음 두 가지를 적용했다.
+
+[A] 과제 조건 충족
+    - BLIP: 이미지 캡셔닝 (V→L)
+    - CLIP: 이미지-텍스트 유사도 (V-L)
+    - GPT-2: 한국어 레시피 생성 (KoGPT2 = skt/kogpt2-base-v2)
+      → GPT-2 아키텍처 기반 한국어 사전학습 모델로,
+        과제 명시 "GPT-2 또는 GPT-oss" 조건을 충족
+
+[B] 음식 인식 정확도 개선 (참고문헌)
+    민현정, "Temporal Difference-based Weighted Instance Segmentation
+    Applied on Consecutive Images for Food Recognition",
+    제어로봇시스템학회 논문지, Vol.29, No.12, pp.987-993 (2023.12).
+
+    원 논문은 연속된 비디오 프레임 간 시간 차이(Temporal Difference)를
+    가중치(Weight)로 활용해 음식 instance segmentation 안정성을 개선한다.
+
+    본 시스템은 입력이 단일 이미지이므로, 데이터 증강을 통해
+    "가상 연속 프레임(virtual consecutive frames)"을 생성하고
+    프레임 간 임베딩 차이를 가중치로 변환하여 동일 원리를 적용했다.
+    안정적인(차이 작은) 프레임은 가중치가 높아지고, 불안정한 프레임은
+    가중치가 낮아지므로 노이즈/조명/각도 변화에 강건한 음식 인식이 가능하다.
+=========================================================
+"""
+
 import torch
 import gradio as gr
+from PIL import Image, ImageEnhance
 from transformers import (
     AutoProcessor,
     BlipForConditionalGeneration,
     CLIPProcessor,
     CLIPModel,
+    PreTrainedTokenizerFast,
+    GPT2LMHeadModel,
 )
 
 
@@ -16,8 +49,7 @@ print("사용 장치:", device)
 
 
 # =========================================================
-# 2. 오픈소스 BLIP 모델 로드
-#    역할: 이미지 캡션 생성
+# 2. BLIP 모델 로드 (이미지 캡셔닝)
 # =========================================================
 print("BLIP 모델 로딩 중...")
 blip_processor = AutoProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
@@ -28,13 +60,36 @@ print("BLIP 모델 로딩 완료")
 
 
 # =========================================================
-# 3. 오픈소스 CLIP 모델 로드
-#    역할: 이미지와 음식 후보 텍스트 유사도 비교
+# 3. CLIP 모델 로드 (이미지-텍스트 유사도)
 # =========================================================
 print("CLIP 모델 로딩 중...")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 print("CLIP 모델 로딩 완료")
+
+
+# =========================================================
+# 3-1. [NEW] GPT-2 모델 로드 (한국어 레시피 생성)
+#       skt/kogpt2-base-v2: GPT-2 아키텍처 기반 한국어 사전학습 모델
+# =========================================================
+print("KoGPT2 (GPT-2 기반) 모델 로딩 중...")
+try:
+    kogpt2_tokenizer = PreTrainedTokenizerFast.from_pretrained(
+        "skt/kogpt2-base-v2",
+        bos_token="</s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        pad_token="<pad>",
+        mask_token="<mask>",
+    )
+    kogpt2_model = GPT2LMHeadModel.from_pretrained("skt/kogpt2-base-v2").to(device)
+    kogpt2_model.eval()
+    KOGPT2_AVAILABLE = True
+    print("KoGPT2 모델 로딩 완료")
+except Exception as e:
+    print(f"KoGPT2 로딩 실패: {e}")
+    print("→ 템플릿 기반 생성으로만 동작합니다.")
+    KOGPT2_AVAILABLE = False
 
 
 # =========================================================
@@ -64,8 +119,7 @@ def normalize_features(features):
 
 
 # =========================================================
-# 5. 전세계 음식 후보 리스트
-#    이 리스트가 많아질수록 대응 가능한 음식 범위가 넓어진다.
+# 5. 전세계 음식 후보 리스트 (변경 없음)
 # =========================================================
 FOOD_CANDIDATES = [
     # Korean
@@ -174,7 +228,7 @@ FOOD_CANDIDATES = [
 ]
 
 
-# =========================================================
+# ========================================================
 # 6. CLIP 텍스트 후보 임베딩 사전 계산
 # =========================================================
 print("CLIP 음식 후보 임베딩 생성 중...")
@@ -212,45 +266,133 @@ print("CLIP 음식 후보 임베딩 생성 완료")
 
 
 # =========================================================
-# 7. BLIP 캡션 생성
+# 6-1. [NEW] 가상 연속 프레임 생성
+#       Min(2023) Temporal Difference-based Weighted 방법 응용
+#
+# 단일 이미지에서 5개의 "가상 프레임"을 생성한다.
+# 각 프레임은 서로 다른 시점/조명/구도를 시뮬레이션하며,
+# 원 논문의 "연속된 비디오 프레임" 역할을 수행한다.
 # =========================================================
-def generate_blip_caption(image):
+def generate_virtual_frames(image, num_frames=5):
+    """하나의 정적 이미지로부터 가상 연속 프레임 K개 생성."""
     image = image.convert("RGB")
+    w, h = image.size
+    frames = []
+
+    # Frame 0: 원본 (anchor)
+    frames.append(image)
+
+    # Frame 1: Center crop 80% → 확대 (zoom-in)
+    crop_size = int(min(w, h) * 0.8)
+    left = (w - crop_size) // 2
+    top = (h - crop_size) // 2
+    cropped = image.crop((left, top, left + crop_size, top + crop_size))
+    cropped = cropped.resize((w, h), Image.BILINEAR)
+    frames.append(cropped)
+
+    # Frame 2: 약간 회전 (+10°) → 카메라 각도 변화
+    rotated = image.rotate(10, resample=Image.BILINEAR, fillcolor=(255, 255, 255))
+    frames.append(rotated)
+
+    # Frame 3: 밝기 증가 (1.2x) → 조명 변화
+    enhancer = ImageEnhance.Brightness(image)
+    brighter = enhancer.enhance(1.2)
+    frames.append(brighter)
+
+    # Frame 4: 좌우 반전 → 대칭성 확인
+    flipped = image.transpose(Image.FLIP_LEFT_RIGHT)
+    frames.append(flipped)
+
+    return frames[:num_frames]
+
+
+# =========================================================
+# 6-2. [NEW] 프레임별 CLIP 임베딩 계산
+# =========================================================
+def compute_frame_features(frames):
+    """K개 프레임에 대한 CLIP 이미지 임베딩 [K, D] 반환."""
+    features_list = []
+
+    with torch.no_grad():
+        for frame in frames:
+            inputs = clip_processor(
+                images=frame,
+                return_tensors="pt",
+            ).to(device)
+
+            raw_features = clip_model.get_image_features(**inputs)
+            features = extract_tensor(raw_features)
+            features = normalize_features(features)
+            features_list.append(features)
+
+    return torch.cat(features_list, dim=0)
+
+
+# =========================================================
+# 6-3. [NEW] Temporal Difference → 가중치 변환 (논문 핵심)
+#
+# 원 논문 (Min, 2023):
+#   - 인접 프레임 간 차이가 작은 영역은 안정된 객체 → 신뢰도↑
+#   - 차이가 큰 영역은 노이즈/움직임 → 신뢰도↓
+#
+# 본 적용:
+#   - 각 가상 프레임의 임베딩 벡터 간 L2 거리로 차이 측정
+#   - 차이가 작을수록 안정적 표현 → 가중치↑ (exp 감쇠)
+# =========================================================
+def compute_temporal_difference_weights(frame_features, alpha=2.0):
+    """프레임별 시간차 기반 가중치 [K] 반환."""
+    K = frame_features.shape[0]
+    differences = []
+
+    for i in range(K):
+        if i == 0:
+            d = torch.norm(frame_features[i] - frame_features[i + 1], p=2)
+        elif i == K - 1:
+            d = torch.norm(frame_features[i] - frame_features[i - 1], p=2)
+        else:
+            d_fwd = torch.norm(frame_features[i] - frame_features[i + 1], p=2)
+            d_bwd = torch.norm(frame_features[i] - frame_features[i - 1], p=2)
+            d = (d_fwd + d_bwd) / 2
+        differences.append(d)
+
+    differences = torch.stack(differences)
+    weights = torch.exp(-alpha * differences)
+    weights = weights / weights.sum()
+
+    return weights, differences
+
+
+# =========================================================
+# 7. [MODIFIED] BLIP 캡션 생성 - TDW 적용 버전
+# =========================================================
+def generate_blip_caption_tdw(image, use_tdw=True):
+    """TDW 방식으로 가장 안정적인 프레임의 BLIP 캡션을 사용."""
+    image = image.convert("RGB")
+
+    if use_tdw:
+        frames = generate_virtual_frames(image, num_frames=5)
+        frame_features = compute_frame_features(frames)
+        weights, _ = compute_temporal_difference_weights(frame_features)
+        best_idx = int(torch.argmax(weights).item())
+        target_image = frames[best_idx]
+    else:
+        target_image = image
 
     captions = []
 
     with torch.no_grad():
-        inputs = blip_processor(
-            image,
-            return_tensors="pt",
-        ).to(device)
-
-        output = blip_model.generate(
-            **inputs,
-            max_new_tokens=50,
-        )
-
-        caption = blip_processor.decode(
-            output[0],
-            skip_special_tokens=True,
-        )
+        inputs = blip_processor(target_image, return_tensors="pt").to(device)
+        output = blip_model.generate(**inputs, max_new_tokens=50)
+        caption = blip_processor.decode(output[0], skip_special_tokens=True)
         captions.append(caption)
 
         inputs_food = blip_processor(
-            image,
+            target_image,
             text="a photo of food:",
             return_tensors="pt",
         ).to(device)
-
-        output_food = blip_model.generate(
-            **inputs_food,
-            max_new_tokens=50,
-        )
-
-        caption_food = blip_processor.decode(
-            output_food[0],
-            skip_special_tokens=True,
-        )
+        output_food = blip_model.generate(**inputs_food, max_new_tokens=50)
+        caption_food = blip_processor.decode(output_food[0], skip_special_tokens=True)
         captions.append(caption_food)
 
     captions = [c.strip() for c in captions if c and c.strip()]
@@ -258,46 +400,45 @@ def generate_blip_caption(image):
 
     if captions:
         return captions[0]
-
     return "food"
 
 
 # =========================================================
-# 8. CLIP 기반 음식 Top-K 추정
+# 8. [MODIFIED] CLIP 기반 음식 인식 - TDW 적용 버전
+#
+# Pipeline:
+#     1. 가상 연속 프레임 K=5 생성
+#     2. 각 프레임의 CLIP 이미지 임베딩 계산
+#     3. 프레임 간 시간차 → 가중치 변환
+#     4. 프레임별 음식 유사도를 가중 합산
+#     5. 가장 높은 점수의 음식 K개 반환
 # =========================================================
-def predict_food_with_clip(image, top_k=5):
+def predict_food_with_tdw(image, top_k=5, alpha=2.0, return_debug=False):
+    """Temporal-Difference-Weighted 음식 인식."""
     image = image.convert("RGB")
 
+    frames = generate_virtual_frames(image, num_frames=5)
+    frame_features = compute_frame_features(frames)
+
+    frame_weights, frame_diffs = compute_temporal_difference_weights(
+        frame_features, alpha=alpha
+    )
+
     with torch.no_grad():
-        image_inputs = clip_processor(
-            images=image,
-            return_tensors="pt",
-        ).to(device)
-
-        raw_image_features = clip_model.get_image_features(**image_inputs)
-        image_features = extract_tensor(raw_image_features)
-        image_features = normalize_features(image_features)
-
-        similarities = (image_features @ text_features.T).squeeze(0)
+        similarities = frame_features @ text_features.T
+        weighted_similarities = (frame_weights.unsqueeze(1) * similarities).sum(dim=0)
 
     food_scores = {}
-
-    for prompt_idx, score in enumerate(similarities.tolist()):
+    for prompt_idx, score in enumerate(weighted_similarities.tolist()):
         food_idx = PROMPT_TO_FOOD_INDEX[prompt_idx]
-
         if food_idx not in food_scores:
             food_scores[food_idx] = score
         else:
             food_scores[food_idx] = max(food_scores[food_idx], score)
 
-    sorted_foods = sorted(
-        food_scores.items(),
-        key=lambda x: x[1],
-        reverse=True,
-    )
+    sorted_foods = sorted(food_scores.items(), key=lambda x: x[1], reverse=True)
 
     results = []
-
     for food_idx, score in sorted_foods[:top_k]:
         food = FOOD_CANDIDATES[food_idx]
         results.append({
@@ -307,11 +448,142 @@ def predict_food_with_clip(image, top_k=5):
             "score": score,
         })
 
+    if return_debug:
+        debug_info = {
+            "frame_weights": frame_weights.tolist(),
+            "frame_diffs": frame_diffs.tolist(),
+            "num_frames": len(frames),
+        }
+        return results, debug_info
+
     return results
 
 
 # =========================================================
-# 9. 한국어 레시피 생성
+# 8-1. [LEGACY] 기존 단일 이미지 방식 (비교 분석용으로 보존)
+# =========================================================
+def predict_food_with_clip_legacy(image, top_k=5):
+    """기존 방식 (TDW 미적용). 비교 실험용."""
+    image = image.convert("RGB")
+
+    with torch.no_grad():
+        image_inputs = clip_processor(images=image, return_tensors="pt").to(device)
+        raw_image_features = clip_model.get_image_features(**image_inputs)
+        image_features = extract_tensor(raw_image_features)
+        image_features = normalize_features(image_features)
+        similarities = (image_features @ text_features.T).squeeze(0)
+
+    food_scores = {}
+    for prompt_idx, score in enumerate(similarities.tolist()):
+        food_idx = PROMPT_TO_FOOD_INDEX[prompt_idx]
+        if food_idx not in food_scores:
+            food_scores[food_idx] = score
+        else:
+            food_scores[food_idx] = max(food_scores[food_idx], score)
+
+    sorted_foods = sorted(food_scores.items(), key=lambda x: x[1], reverse=True)
+    results = []
+    for food_idx, score in sorted_foods[:top_k]:
+        food = FOOD_CANDIDATES[food_idx]
+        results.append({
+            "ko": food["ko"],
+            "en": food["en"],
+            "category": food["category"],
+            "score": score,
+        })
+    return results
+
+
+# =========================================================
+# 9. [NEW] GPT-2 기반 레시피 보조 생성
+#
+# KoGPT2(GPT-2 한국어 변종)을 활용해 음식별 자연어 텍스트 생성.
+# 베이스 GPT-2는 instruction-tuning 없으므로 전체 레시피보다는
+# 소개·팁 등 짧은 자유 텍스트 생성에 활용한다.
+#   → 신뢰성 있는 구조(재료/단계)는 템플릿 유지
+#   → 창의성 있는 자연어 부분만 GPT-2로 생성하는 하이브리드
+# =========================================================
+def generate_gpt2_description(food_name, max_new_tokens=60):
+    """KoGPT2로 음식에 대한 짧은 소개 문장 생성."""
+    if not KOGPT2_AVAILABLE:
+        return None
+
+    prompt = f"{food_name}은(는)"
+
+    try:
+        input_ids = kogpt2_tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            output_ids = kogpt2_model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                top_k=50,
+                top_p=0.92,
+                temperature=0.8,
+                repetition_penalty=1.3,
+                pad_token_id=kogpt2_tokenizer.pad_token_id,
+                eos_token_id=kogpt2_tokenizer.eos_token_id,
+            )
+
+        generated = kogpt2_tokenizer.decode(
+            output_ids[0],
+            skip_special_tokens=True,
+        )
+
+        # 첫 문장만 깔끔하게 추출
+        for end_mark in ["다.", "요.", "다 ", "요 "]:
+            if end_mark in generated:
+                generated = generated.split(end_mark)[0] + end_mark.strip()
+                break
+
+        return generated.strip()
+    except Exception as e:
+        print(f"GPT-2 생성 오류: {e}")
+        return None
+
+
+def generate_gpt2_tip(food_name, max_new_tokens=50):
+    """KoGPT2로 음식 조리 팁 생성."""
+    if not KOGPT2_AVAILABLE:
+        return None
+
+    prompt = f"{food_name}을(를) 더 맛있게 만드는 방법은"
+
+    try:
+        input_ids = kogpt2_tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            output_ids = kogpt2_model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                top_k=40,
+                top_p=0.9,
+                temperature=0.7,
+                repetition_penalty=1.4,
+                pad_token_id=kogpt2_tokenizer.pad_token_id,
+                eos_token_id=kogpt2_tokenizer.eos_token_id,
+            )
+
+        generated = kogpt2_tokenizer.decode(
+            output_ids[0],
+            skip_special_tokens=True,
+        )
+
+        for end_mark in ["다.", "요.", "다 ", "요 "]:
+            if end_mark in generated:
+                generated = generated.split(end_mark)[0] + end_mark.strip()
+                break
+
+        return generated.strip()
+    except Exception as e:
+        print(f"GPT-2 생성 오류: {e}")
+        return None
+
+
+# =========================================================
+# 10. [MODIFIED] 한국어 레시피 생성 (템플릿 + GPT-2 하이브리드)
 # =========================================================
 def generate_recipe(food, user_request):
     food_name = food["ko"]
@@ -342,7 +614,6 @@ def generate_recipe(food, user_request):
         category,
         ["주재료", "채소", "소금", "후추", "기호에 따른 소스"]
     )
-
     ingredient_text = "\n".join([f"- {item}" for item in ingredients])
 
     if category in ["stew", "soup"]:
@@ -406,11 +677,21 @@ def generate_recipe(food, user_request):
 7. 그릇에 담고 토핑을 올려 완성합니다.
 """
 
-    extra = ""
+    # [NEW] GPT-2 기반 소개 + 팁 생성
+    gpt2_intro = generate_gpt2_description(food_name)
+    gpt2_tip = generate_gpt2_tip(food_name)
 
+    ai_section = ""
+    if gpt2_intro or gpt2_tip:
+        ai_section = "\n🤖 GPT-2 생성 코너\n"
+        if gpt2_intro:
+            ai_section += f"- 소개: {gpt2_intro}\n"
+        if gpt2_tip:
+            ai_section += f"- 팁: {gpt2_tip}\n"
+
+    extra = ""
     if user_request:
         req = user_request.strip()
-
         if "맵" in req or "매운" in req:
             extra += """
 🌶️ 요청 반영: 더 맵게 만들기
@@ -418,7 +699,6 @@ def generate_recipe(food, user_request):
 - 청양고추를 넣으면 깔끔한 매운맛이 납니다.
 - 처음부터 많이 넣지 말고 마지막에 조금씩 조절하는 것이 좋습니다.
 """
-
         if "다이어트" in req or "칼로리" in req or "살" in req:
             extra += """
 🥗 요청 반영: 다이어트 버전
@@ -426,14 +706,12 @@ def generate_recipe(food, user_request):
 - 튀김보다 굽기, 삶기, 찌기 방식을 사용하세요.
 - 소스와 소금 사용량을 줄이고 채소를 늘리면 좋습니다.
 """
-
         if "초보" in req or "쉽게" in req:
             extra += """
 🔰 요청 반영: 초보자용 설명
 - 재료 손질 → 예열 → 주재료 익히기 → 간 맞추기 순서만 기억하면 됩니다.
 - 불은 처음부터 강하게 하지 말고 중불 위주로 조리하세요.
 """
-
         if "1인분" in req:
             extra += """
 🍴 요청 반영: 1인분 기준
@@ -459,13 +737,13 @@ def generate_recipe(food, user_request):
 
 👨‍🍳 초보자용 조리 방법
 {method}
-
+{ai_section}
 {extra}
 """
 
 
 # =========================================================
-# 10. 사용자 메시지 처리
+# 11. [MODIFIED] 사용자 메시지 처리 - TDW + Top-K 표시
 # =========================================================
 def process_message(image, user_text, chat_history, current_food_name):
     if chat_history is None:
@@ -477,41 +755,47 @@ def process_message(image, user_text, chat_history, current_food_name):
         return chat_history, current_food_name, None, ""
 
     if image is not None:
-        top_foods = predict_food_with_clip(image, top_k=5)
+        top_foods, debug = predict_food_with_tdw(
+            image, top_k=5, return_debug=True
+        )
         selected_food = top_foods[0]
+
+        top3_text = "\n".join([
+            f"  {i+1}. {f['ko']} (유사도: {f['score']:.3f})"
+            for i, f in enumerate(top_foods[:3])
+        ])
+
+        weight_text = ", ".join([f"{w:.2f}" for w in debug["frame_weights"]])
+
+        method_header = f"""
+📌 인식 결과 (TDW 방식, Min 2023 응용)
+
+🔍 Top-3 후보:
+{top3_text}
+
+🎞️ 가상 프레임 가중치 (안정성):
+  [원본 / 크롭 / 회전 / 밝기 / 반전] = [{weight_text}]
+  → 안정적인 프레임일수록 가중치 ↑
+
+---
+"""
 
         user_message = "음식 사진을 업로드했습니다."
         if user_text:
             user_message += f"\n\n{user_text}"
 
-        assistant_message = generate_recipe(selected_food, user_text)
+        assistant_message = method_header + generate_recipe(selected_food, user_text)
 
-        chat_history.append({
-            "role": "user",
-            "content": user_message
-        })
-
-        chat_history.append({
-            "role": "assistant",
-            "content": assistant_message
-        })
+        chat_history.append({"role": "user", "content": user_message})
+        chat_history.append({"role": "assistant", "content": assistant_message})
 
         return chat_history, selected_food["ko"], None, ""
 
     if image is None and user_text != "":
         if not current_food_name:
             assistant_message = "먼저 음식 사진을 업로드해주세요. 사진을 분석한 뒤 추가 질문에 답할 수 있습니다."
-
-            chat_history.append({
-                "role": "user",
-                "content": user_text
-            })
-
-            chat_history.append({
-                "role": "assistant",
-                "content": assistant_message
-            })
-
+            chat_history.append({"role": "user", "content": user_text})
+            chat_history.append({"role": "assistant", "content": assistant_message})
             return chat_history, current_food_name, None, ""
 
         fake_food = {
@@ -522,28 +806,22 @@ def process_message(image, user_text, chat_history, current_food_name):
         }
 
         assistant_message = generate_recipe(fake_food, user_text)
-
-        chat_history.append({
-            "role": "user",
-            "content": user_text
-        })
-
-        chat_history.append({
-            "role": "assistant",
-            "content": assistant_message
-        })
-
+        chat_history.append({"role": "user", "content": user_text})
+        chat_history.append({"role": "assistant", "content": assistant_message})
         return chat_history, current_food_name, None, ""
 
     return chat_history, current_food_name, None, ""
 
 
 # =========================================================
-# 11. UI
+# 12. UI
 # =========================================================
 with gr.Blocks() as demo:
     gr.Markdown("""
-    # 🍳 AI 음식 레시피 챗봇
+    # 🍳 AI 음식 레시피 챗봇 v2
+
+    **사용 모델**: BLIP + CLIP + GPT-2 (KoGPT2)  
+    **인식 방식**: Temporal Difference-based Weighted (Min, 2023 응용)
 
     음식 사진과 요청사항을 함께 입력하면  
     AI가 음식명을 추정하고 한국어 레시피를 대화형으로 제공합니다.
@@ -551,16 +829,10 @@ with gr.Blocks() as demo:
 
     current_food_state = gr.State("")
 
-    chatbot = gr.Chatbot(
-        label="대화",
-        height=600,
-    )
+    chatbot = gr.Chatbot(label="대화", height=600, type="messages")
 
     with gr.Row():
-        image_input = gr.Image(
-            type="pil",
-            label="사진 첨부",
-        )
+        image_input = gr.Image(type="pil", label="사진 첨부")
 
     with gr.Row():
         user_input = gr.Textbox(
@@ -569,43 +841,20 @@ with gr.Blocks() as demo:
             lines=2,
             scale=5,
         )
-
-        send_button = gr.Button(
-            "전송",
-            scale=1,
-        )
+        send_button = gr.Button("전송", scale=1)
 
     send_button.click(
         fn=process_message,
-        inputs=[
-            image_input,
-            user_input,
-            chatbot,
-            current_food_state,
-        ],
-        outputs=[
-            chatbot,
-            current_food_state,
-            image_input,
-            user_input,
-        ],
+        inputs=[image_input, user_input, chatbot, current_food_state],
+        outputs=[chatbot, current_food_state, image_input, user_input],
     )
 
     user_input.submit(
         fn=process_message,
-        inputs=[
-            image_input,
-            user_input,
-            chatbot,
-            current_food_state,
-        ],
-        outputs=[
-            chatbot,
-            current_food_state,
-            image_input,
-            user_input,
-        ],
+        inputs=[image_input, user_input, chatbot, current_food_state],
+        outputs=[chatbot, current_food_state, image_input, user_input],
     )
 
 
-demo.launch()
+if __name__ == "__main__":
+    demo.launch()
